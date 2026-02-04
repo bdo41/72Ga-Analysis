@@ -1,6 +1,18 @@
 #include<time.h>
 #include<string>
 
+//Adding these to help with testing calibrations
+#include <map>
+#include <sstream>
+#include <vector>
+
+#include "TCanvas.h"
+#include "TPad.h"
+#include "TGraphErrors.h"
+#include "TLine.h"
+#include "TDirectory.h"
+//Testing Calibration block
+
 #include "TROOT.h"
 #include "TFile.h"
 #include "TH1.h"
@@ -23,19 +35,260 @@ bool Clean(const ClarionTrinity::Clover *clover) {
   return !(clover->nNonPrompt > 0 || clover->nSuppress > 0);
 }
 
+////Another block to test calibrations 
+// -------------------- Calibration-check helpers (linear only) --------------------
+
+struct CalRow {
+  int ybin;
+  double ycenter;
+  double ch;
+  double cherr;
+  double Eexp;
+};
+
+struct CalCoef {
+  double p0 = 0.0; // intercept
+  double p1 = 1.0; // slope
+  bool ok = false;
+};
+
+struct CloverMapResult {
+  bool ok = false;
+  char clover = '?';   // 'A','B',...
+  int xtal = -1;       // 0..3 within clover
+  int crystal_id = -1; // ybin-1
+  int ybin = -1;
+};
+
+// Your ybin->clover ranges
+static CloverMapResult MapYbinToClover(int ybin) {
+  CloverMapResult r;
+  r.ybin = ybin;
+  r.crystal_id = ybin - 1;
+
+  struct Range { char c; int lo; int hi; };
+  static const Range ranges[] = {
+    {'A',  1,  4},
+    {'B',  6,  9},
+    {'C', 11, 14},
+    {'D', 17, 20},
+    {'E', 22, 25},
+    {'G', 33, 36},
+    {'H', 38, 41},
+    {'I', 43, 46},
+    {'J', 49, 52},
+  };
+
+  for (const auto& rr : ranges) {
+    if (ybin >= rr.lo && ybin <= rr.hi) {
+      r.ok = true;
+      r.clover = rr.c;
+      r.xtal = ybin - rr.lo; // 0..3
+      return r;
+    }
+  }
+  return r; // ok=false if ybin not in any clover range
+}
+
+// Clover letter -> numeric index used in your cal-coefficient file
+// Based on your file having clovers 1..5,7..10 and placeholders for 6,11,12.
+static int CloverLetterToNumber(char c) {
+  switch (c) {
+    case 'A': return 1;
+    case 'B': return 2;
+    case 'C': return 3;
+    case 'D': return 4;
+    case 'E': return 5;
+    case 'G': return 7;
+    case 'H': return 8;
+    case 'I': return 9;
+    case 'J': return 10;
+    default:  return -1;
+  }
+}
+
+// Read centroid TSV: ybin ycenter channel chan_err energy_keV
+static bool ReadEu152CentroidsTSV(const std::string& path,
+                                 std::map<int, std::vector<CalRow>>& byYbin)
+{
+  byYbin.clear();
+  std::ifstream fin(path);
+  if (!fin) {
+    std::cerr << "ERROR: cannot open centroid TSV: " << path << "\n";
+    return false;
+  }
+
+  std::string line;
+  bool first = true;
+  while (std::getline(fin, line)) {
+    if (line.empty()) continue;
+    if (first) { first = false; continue; } // skip header row
+
+    std::istringstream iss(line);
+    CalRow r{};
+    if (!(iss >> r.ybin >> r.ycenter >> r.ch >> r.cherr >> r.Eexp)) continue;
+    byYbin[r.ybin].push_back(r);
+  }
+  return !byYbin.empty();
+}
+
+// Read cal coefficients: clover crystal intercept slope [maybe extra column(s)]
+// We'll read first 4 tokens and ignore anything else on the line.
+static bool ReadLinearCalCoefFile(const std::string& path,
+                                 std::map<std::pair<int,int>, CalCoef>& coef)
+{
+  coef.clear();
+  std::ifstream fin(path);
+  if (!fin) {
+    std::cerr << "ERROR: cannot open cal coef file: " << path << "\n";
+    return false;
+  }
+
+  std::string line;
+  while (std::getline(fin, line)) {
+    if (line.empty()) continue;
+    if (line[0] == '#') continue;
+
+    std::istringstream iss(line);
+    int cl = -1, xt = -1;
+    double p0 = 0.0, p1 = 1.0;
+
+    if (!(iss >> cl >> xt >> p0 >> p1)) continue;
+
+    CalCoef c;
+    c.p0 = p0;
+    c.p1 = p1;
+    c.ok = true;
+    coef[{cl, xt}] = c;
+  }
+  return !coef.empty();
+}
+
+// Make and write one residual canvas per crystal into out->/cal_check/
+// ?E = (p0+p1*ch) - E_expected
+static void MakeCalResidualPlots_Linear(TFile* out,
+                                       const std::string& centroidTSV,
+                                       const std::string& calfile,
+                                       bool onlyMappedYbins = true)
+{
+  std::map<int, std::vector<CalRow>> byYbin;
+  if (!ReadEu152CentroidsTSV(centroidTSV, byYbin)) return;
+
+  std::map<std::pair<int,int>, CalCoef> coef;
+  if (!ReadLinearCalCoefFile(calfile, coef)) return;
+
+  TDirectory* saveDir = gDirectory;
+  TDirectory* d = out->GetDirectory("cal_check");
+  if (!d) d = out->mkdir("cal_check");
+  d->cd();
+
+  int made = 0;
+
+  for (auto& kv : byYbin) {
+    const int ybin = kv.first;
+    auto& rows = kv.second;
+    if ((int)rows.size() < 2) continue;
+
+    auto info = MapYbinToClover(ybin);
+    if (onlyMappedYbins && !info.ok) continue;
+
+    int cloverNum = info.ok ? CloverLetterToNumber(info.clover) : -1;
+    int xtalNum   = info.ok ? info.xtal : -1;
+    if (onlyMappedYbins && (cloverNum < 0 || xtalNum < 0)) continue;
+
+    auto it = coef.find({cloverNum, xtalNum});
+    if (it == coef.end() || !it->second.ok) {
+      std::cerr << "WARN: no coef for ybin " << ybin
+                << " (clover " << info.clover << "=" << cloverNum
+                << ", xtal " << xtalNum << ")\n";
+      continue;
+    }
+    const auto& cc = it->second;
+
+    // Build graph ?E(E)
+    auto* g = new TGraphErrors((int)rows.size());
+    g->SetName(Form("g_cal_res_ybin%d", ybin));
+    g->SetMarkerStyle(20);
+
+    double Emin = 1e9, Emax = -1e9;
+    double dEmin = 1e9, dEmax = -1e9;
+
+    for (int i = 0; i < (int)rows.size(); i++) {
+      const double Eexp = rows[i].Eexp;
+      const double ch   = rows[i].ch;
+      const double dch  = rows[i].cherr;
+
+      const double Ecal = cc.p0 + cc.p1 * ch;
+      const double dE   = Ecal - Eexp;
+      const double dEerr = std::abs(cc.p1) * dch; // linear propagation
+
+      g->SetPoint(i, Eexp, dE);
+      g->SetPointError(i, 0.0, dEerr);
+
+      Emin = std::min(Emin, Eexp);
+      Emax = std::max(Emax, Eexp);
+      dEmin = std::min(dEmin, dE - dEerr);
+      dEmax = std::max(dEmax, dE + dEerr);
+    }
+
+    // Nice label
+    std::string tag;
+    if (info.ok) {
+      tag = Form("Clover %c crystal %d (ybin %d, crystalID %d)  p0=%.5f p1=%.5f",
+                 info.clover, info.xtal, info.ybin, info.crystal_id, cc.p0, cc.p1);
+    } else {
+      tag = Form("ybin %d (crystalID %d)  p0=%.5f p1=%.5f", ybin, ybin-1, cc.p0, cc.p1);
+    }
+
+    TCanvas* c = new TCanvas(Form("cal_residual_ybin%d", ybin),
+                             tag.c_str(), 900, 450);
+
+    g->SetTitle(Form("%s;Energy (keV);#DeltaE = E_{cal} - E_{exp} (keV)", tag.c_str()));
+    g->Draw("AP");
+
+    // force a sensible y-range
+    double pad = 0.15 * std::max(1e-6, (dEmax - dEmin));
+    g->GetYaxis()->SetRangeUser(dEmin - pad, dEmax + pad);
+
+    // 0-line
+    TLine* l0 = new TLine(Emin, 0.0, Emax, 0.0);
+    l0->SetLineColor(kRed);
+    l0->SetLineStyle(2);
+    l0->SetLineWidth(2);
+    l0->Draw("same");
+
+    c->Write();
+    g->Write();
+
+    delete l0;
+    delete c;
+    delete g;
+    made++;
+  }
+
+  std::cout << "CalCheck: made " << made << " residual canvases in /cal_check/\n";
+  saveDir->cd();
+}
+///END OF Calibration Block
+
+
 int main(int argc, char **argv) {
   double pi = 3.1415926535;
   //process options and command line arguments
   int opt;
   int verbose = 0;
   int projectileDetected = 0;
-  while ((opt = getopt(argc, argv, "vp")) != -1) {
+  int makeCalPlots = 0;
+  while ((opt = getopt(argc, argv, "vpC")) != -1) {
   switch (opt) {
   case 'v':
     verbose = 1;
     break;
   case 'p':
     projectileDetected = 1;
+    break;
+  case 'C':
+    makeCalPlots = 1;
     break;
     default:
       abort();
@@ -53,6 +306,22 @@ int main(int argc, char **argv) {
   std::cout << "                      Histograms to : " << ANSI_COLOR_GREEN << outfilename << ANSI_COLOR_RESET << std::endl;
   std::string fileopt(argv[optind+2]);
   std::string calfile(argv[optind+3]); 
+
+
+  ////THIS IS FOR THE CALIBRATION TESTING FEB 4
+  std::string centroidTSV = "";
+  std::string coefFile    = "";
+
+  if (makeCalPlots) {
+    if (argc - optind < 5) {
+      std::cout << "usage: ./FESort -C [file list] [output file] [write option] "
+	"[clarion_cal] [eu152_peaks.tsv]\n";
+      return 0;
+    }
+    centroidTSV = argv[optind+4];
+  }
+  ///CALIBRATION TESTING 
+
 
   //data files
   std::vector<std::string> dataPaths;
@@ -873,6 +1142,14 @@ int main(int argc, char **argv) {
   tracefile->Write();
   tracefile->Close(); 
   h_calib_en_all->Write();
+
+  //AGAIN CALIBRATION TESTING
+  if (makeCalPlots) {
+    std::cout << "CalCheck: using calfile=" << calfile
+	      << " centroids=" << centroidTSV << "\n";
+    MakeCalResidualPlots_Linear(&file, centroidTSV, calfile, true);
+}
+  ///CALIBRATION TESTING
 
   file.Purge();
   file.GetDirectory("trin_pid")->Purge();
