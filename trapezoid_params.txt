@@ -1,0 +1,2 @@
+#id  fL   fG   sL   sG   tau    D  S    ffThr  cfdThr
+0    20   0    3   1    50.6     5  1    100.    15.

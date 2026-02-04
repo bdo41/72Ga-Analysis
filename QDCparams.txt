@@ -1,0 +1,9 @@
+#window     width   type
+0           31      B
+1           29      B
+2           15      E
+3           20      P
+4           10      E
+5           55      T
+6           15      E
+7           25      PB
