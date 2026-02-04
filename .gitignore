@@ -25,3 +25,11 @@ AutoCal_Gaballah.C
 152Eu_ON_a-013.evt.to.to
 *~
 *#
+src/FESortNoDopplerBU9825.cc
+src/FESortTestingDoppler.cc
+src/SortFunctions_BU121125.hh
+src/BasicSort_BU12425.cc
+FESort
+CoulexSort
+BasicSort
+pxi-time-order
