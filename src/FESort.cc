@@ -711,8 +711,8 @@ int main(int argc, char **argv) {
 	/////
 	/////
 	/////
-	float tTheta = 0.0;
-	float tPhi = 0.0;
+	//float tTheta = 0.0;
+	//float tPhi = 0.0;
 	//////
 	//////
 	/////
@@ -758,7 +758,7 @@ int main(int argc, char **argv) {
 
             //DOPPLER CORRECTION GOES HERE Jan 28 2026 Uncommenting from here to double e_dop_alt = gam_i->Energy/beta_corr_alt; for addback testing (JAN 28 Changed tTheta to pTheta to test it, will get the real value soon)
             
-            double pgcos = std::sin(pTheta*pi/180.0)*std::sin(gTheta*pi/180.0)*std::cos(pPhi*pi/180. - gPhi*pi/180.)
+	    /* double pgcos = std::sin(pTheta*pi/180.0)*std::sin(gTheta*pi/180.0)*std::cos(pPhi*pi/180. - gPhi*pi/180.)
               + std::cos(pTheta*pi/180.0)*std::cos(gTheta*pi/180.0);
             double targ_pgcos = std::sin(tTheta*pi/180.0)*std::sin(gTheta*pi/180.0)*std::cos(tPhi*pi/180. - gPhi*pi/180.)
               + std::cos(tTheta*pi/180.0)*std::cos(gTheta*pi/180.0);
@@ -788,7 +788,7 @@ int main(int argc, char **argv) {
             double beta_alt = betas_alt[ring];
             double beta_corr_alt = std::sqrt(1.0 - beta_alt * beta_alt)/(1.0 - beta_alt * pgcos);
 
-            double e_dop_alt = gam_i->Energy/beta_corr_alt;
+            double e_dop_alt = gam_i->Energy/beta_corr_alt; */
 
 
             
@@ -813,13 +813,13 @@ int main(int argc, char **argv) {
                     float gTheta_j = event.clarion.conf.theta[jCloverID][jCrystalID];
                     float gPhi_j = event.clarion.conf.phi[jCloverID][jCrystalID];
                     // DO DOPPLER CORRECTION HERE uncommented up tp pgg->Fill(e_dop_j, e_dop)
-                    double pgcos_j = std::sin(pTheta*pi/180.0)*std::sin(gTheta_j*pi/180.0)*std::cos(pPhi*pi/180. - gPhi_j*pi/180.)
+		    /* double pgcos_j = std::sin(pTheta*pi/180.0)*std::sin(gTheta_j*pi/180.0)*std::cos(pPhi*pi/180. - gPhi_j*pi/180.)
                       + std::cos(pTheta*pi/180.0)*std::cos(gTheta_j*pi/180.0);
 
                     double beta_corr_j = std::sqrt(1.0 - beta * beta)/(1.0 - beta * pgcos_j);
                     double e_dop_j = gam_j->Energy/beta_corr_j;
                     pgg->Fill(e_dop, e_dop_j);
-                    pgg->Fill(e_dop_j, e_dop);
+                    pgg->Fill(e_dop_j, e_dop); */
 		    
                   }
                 }
@@ -832,8 +832,8 @@ int main(int argc, char **argv) {
             }
 
             //USE DOPPLER-CORRECTED VALUES reintroduced pg_ent and pg_ent (jan 28 uncommented pg_ent and pg_tent for both lines below and in if
-            pg_ent[ring]->Fill(tdiff, e_dop);
-	    pg_tent[ring]->Fill(tdiff, targ_e_dop);
+	    // pg_ent[ring]->Fill(tdiff, e_dop);
+	    //pg_tent[ring]->Fill(tdiff, targ_e_dop);
             double efficiency = 0.0;
             double efficiencyID = 0.0;
             if (gam_i->Energy > 50.0) {
@@ -842,8 +842,8 @@ int main(int argc, char **argv) {
             }
             if (efficiency > 0.0) {
               //USE DOPPLER-CORRECTED VALUES
-              pg_ent_eff[ring]->Fill(tdiff, e_dop, 1.0/efficiency);
-              pg_tent_eff[ring]->Fill(tdiff, targ_e_dop, 1.0/efficiency);
+              //pg_ent_eff[ring]->Fill(tdiff, e_dop, 1.0/efficiency);
+	      // pg_tent_eff[ring]->Fill(tdiff, targ_e_dop, 1.0/efficiency);
             }
           } //gamma loop          
         } //clover loop
