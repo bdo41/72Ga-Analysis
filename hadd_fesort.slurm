@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fesort_hadd
-#SBATCH --time=04:00:00
-#SBATCH --mem-per-cpu=8G
+#SBATCH --time=12:00:00
+#SBATCH --mem-per-cpu=16G
 #SBATCH --cpus-per-task=1
 #SBATCH --output=logs/fesort_hadd_%j.out
 #SBATCH --error=logs/fesort_hadd_%j.err
@@ -25,7 +25,7 @@ cd "$OUTDIR" || { echo "Cannot cd to $OUTDIR"; exit 1; }
 # You may need module load root here, depending on your cluster
 # module load root
 
-hadd -f "$MERGED_OUT" *_fesort.root
+hadd -f "$MERGED_OUT" *.root
 RETVAL=$?
 
 if [ $RETVAL -ne 0 ]; then

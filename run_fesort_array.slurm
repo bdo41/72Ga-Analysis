@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fesort
 #SBATCH --time=04:00:00
-#SBATCH --mem-per-cpu=16G
+#SBATCH --mem-per-cpu=128G
 #SBATCH --cpus-per-task=1
 #SBATCH --array=0-0                     # override this with --array on sbatch
 #SBATCH --output=/data/FSU/rawdata/FSUexp/MSU_Ga72/Slurm_Output/logs/fesort_%A_%a.out

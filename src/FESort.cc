@@ -1,5 +1,6 @@
 #include<time.h>
 #include<string>
+#include<cmath>
 
 //Adding these to help with testing calibrations
 #include <map>
@@ -7,10 +8,13 @@
 #include <vector>
 
 #include "TCanvas.h"
+#include "TLegend.h"
 #include "TPad.h"
 #include "TGraphErrors.h"
 #include "TLine.h"
 #include "TDirectory.h"
+#include "TH1D.h"
+#include "TF1.h"
 //Testing Calibration block
 
 #include "TROOT.h"
@@ -88,6 +92,102 @@ static CloverMapResult MapYbinToClover(int ybin) {
     }
   }
   return r; // ok=false if ybin not in any clover range
+}
+
+//This is here to read a small BEGe calibration file so that it can calibrate the BEGe detectors. I'm hoping that I can add this into a similar slot at clovers later
+struct BEGeCalibration {
+    double intercept = 0.0;
+    double slope = 1.0;
+    bool valid = false;
+};
+
+static bool ReadBEGeCalibration(
+    const std::string& filename,
+    BEGeCalibration cal[3])
+{
+    std::ifstream input(filename);
+
+    if (!input.is_open()) {
+        std::cerr << "ERROR: could not open BEGe calibration file: "
+                  << filename << "\n";
+        return false;
+    }
+
+    std::string line;
+    int rowsLoaded = 0;
+
+    while (std::getline(input, line)) {
+
+        // Ignore blank lines
+        if (line.empty()) {
+            continue;
+        }
+
+        // Ignore comments, including comments with leading spaces
+        const std::size_t firstCharacter =
+            line.find_first_not_of(" \t\r\n");
+
+        if (firstCharacter == std::string::npos) {
+            continue;
+        }
+
+        if (line[firstCharacter] == '#') {
+            continue;
+        }
+
+        std::istringstream stream(line);
+
+        int detector = 0;
+        int crystal = 0;
+        double intercept = 0.0;
+        double slope = 1.0;
+        double shift = 0.0;
+
+        // Expected format:
+        // detector crystal intercept slope shift
+        if (!(stream >> detector
+                     >> crystal
+                     >> intercept
+                     >> slope
+                     >> shift)) {
+
+            std::cerr << "WARNING: could not parse BEGe calibration row:\n"
+                      << line << "\n";
+            continue;
+        }
+
+        if (detector < 1 || detector > 2) {
+            std::cerr << "WARNING: unsupported BEGe detector number "
+                      << detector << "\n";
+            continue;
+        }
+
+        // Each BEGe is treated as one detector, crystal 0
+        if (crystal != 0) {
+            std::cerr << "WARNING: BEGe detector " << detector
+                      << " has unexpected crystal number "
+                      << crystal << "\n";
+        }
+
+        cal[detector].intercept = intercept;
+        cal[detector].slope = slope;
+        cal[detector].valid = true;
+
+        ++rowsLoaded;
+
+        std::cout << "Loaded BEGe " << detector
+                  << " calibration: intercept=" << intercept
+                  << ", slope=" << slope << "\n";
+    }
+
+    std::cout << "Loaded " << rowsLoaded
+              << " BEGe calibration row(s) from "
+              << filename << "\n";
+
+    if (!cal[1].valid) {
+        std::cerr << "ERROR: no valid calibration found for BEGe E1\n";
+    }
+    return cal[1].valid;
 }
 
 // Clover letter -> numeric index used in your cal-coefficient file
@@ -210,8 +310,30 @@ static void MakeCalResidualPlots_Linear(TFile* out,
     g->SetName(Form("g_cal_res_ybin%d", ybin));
     g->SetMarkerStyle(20);
 
+    // --- NEW: graph for "calibration line + peaks" plot
+    // Points are (channel centroid, expected energy)
+    auto* gCal = new TGraphErrors((int)rows.size());
+    gCal->SetName(Form("g_cal_linepoints_ybin%d", ybin));
+    gCal->SetMarkerStyle(20);
+
+    auto* gEE = new TGraphErrors((int)rows.size());
+    gEE->SetName(Form("g_Ecal_vs_Eexp_ybin%d", ybin));
+    gEE->SetMarkerStyle(20);
+
+
+
     double Emin = 1e9, Emax = -1e9;
     double dEmin = 1e9, dEmax = -1e9;
+
+    // --- NEW: residual histogram for this crystal (ybin)
+    const double hLo = -2.0;   // keV, change if you want wider/narrower
+    const double hHi =  2.0;   // keV
+    const int    hBins = 80;
+
+    TH1D* hRes = new TH1D(Form("h_residual_ybin%d", ybin),
+			  Form("Residuals ybin %d;#DeltaE = E_{cal} - E_{exp} (keV);Counts", ybin),
+			  hBins, hLo, hHi);
+
 
     for (int i = 0; i < (int)rows.size(); i++) {
       const double Eexp = rows[i].Eexp;
@@ -220,10 +342,20 @@ static void MakeCalResidualPlots_Linear(TFile* out,
 
       const double Ecal = cc.p0 + cc.p1 * ch;
       const double dE   = Ecal - Eexp;
+      hRes->Fill(dE);//NEW
+
       const double dEerr = std::abs(cc.p1) * dch; // linear propagation
 
       g->SetPoint(i, Eexp, dE);
       g->SetPointError(i, 0.0, dEerr);
+
+      gCal->SetPoint(i, ch, Eexp);
+      gCal->SetPointError(i, dch, 0.0);
+
+      gEE->SetPoint(i, Eexp, Ecal);
+      gEE->SetPointError(i, 0.0, dEerr);  // x error 0, y error from centroid uncertainty
+
+
 
       Emin = std::min(Emin, Eexp);
       Emax = std::max(Emax, Eexp);
@@ -259,10 +391,81 @@ static void MakeCalResidualPlots_Linear(TFile* out,
 
     c->Write();
     g->Write();
+    hRes->Write();   // NEW
 
+    //ANOTHER TESTING CAL PLOT
+    // --- NEW: "calibration line + peaks" canvas
+    TCanvas* c2 = new TCanvas(Form("cal_linepoints_ybin%d", ybin),
+			      Form("%s (line+points)", tag.c_str()), 900, 450);
+
+    gCal->SetTitle(Form("%s;Centroid channel;Expected energy (keV)", tag.c_str()));
+    gCal->Draw("AP");
+
+    // Determine channel range for the red calibration line
+    double chMin = 1e99, chMax = -1e99;
+    for (int i = 0; i < gCal->GetN(); i++) {
+      double x, y;
+      gCal->GetPoint(i, x, y);
+      chMin = std::min(chMin, x);
+      chMax = std::max(chMax, x);
+    }
+
+    // Red calibration line: E = p0 + p1*ch
+    TLine* calLine = new TLine(chMin, cc.p0 + cc.p1*chMin,
+			       chMax, cc.p0 + cc.p1*chMax);
+    calLine->SetLineColor(kRed);
+    calLine->SetLineWidth(2);
+    calLine->Draw("same");
+
+    // Optional legend
+    TLegend* leg = new TLegend(0.12, 0.75, 0.35, 0.88);
+    leg->AddEntry(gCal, "Eu-152 peaks (expected E)", "p");
+    leg->AddEntry(calLine, "Calibration: E = p0 + p1*ch", "l");
+    leg->Draw();
+
+    c2->Write();
+    gCal->Write();
+
+    //YET ANOTHER TESTING PLOT
+    TCanvas* cEE = new TCanvas(Form("cal_Ecal_vs_Eexp_ybin%d", ybin),
+                           Form("%s (Ecal vs Eexp)", tag.c_str()), 900, 450);
+
+    gEE->SetTitle(Form("%s;Expected energy E_{exp} (keV);Calibrated energy E_{cal} (keV)", tag.c_str()));
+    gEE->Draw("AP");
+
+    // Determine plot range
+    double Emin2 = 1e99, Emax2 = -1e99;
+    for (int i = 0; i < gEE->GetN(); i++) {
+      double x, y;
+      gEE->GetPoint(i, x, y);
+      Emin2 = std::min(Emin2, x);
+      Emax2 = std::max(Emax2, x);
+    }
+
+    // Ideal line y = x
+    TLine* yEqx = new TLine(Emin2, Emin2, Emax2, Emax2);
+    yEqx->SetLineColor(kRed);
+    yEqx->SetLineWidth(2);
+    yEqx->Draw("same");
+
+    cEE->Write();
+    gEE->Write();
+
+    delete yEqx;
+    delete cEE;
+    delete gEE;
+
+
+    delete leg;
+    delete calLine;
+    delete c2;
+
+
+    delete hRes;     // NEW
     delete l0;
     delete c;
     delete g;
+    delete gCal; //NEW
     made++;
   }
 
@@ -367,6 +570,42 @@ int main(int argc, char **argv) {
   //clean particle threshold
   double tdiff_thresh = 100.0; //ns
 
+  // Prompt gamma-gamma coincidence gate.
+  // Tune this value later using a gamma-gamma time-difference spectrum if needed.
+  const double gg_tdiff_thresh = 200.0; // ns
+
+  auto gg_dt_ns = [](const auto* first, const auto* second) {
+    return ((long long int)first->timestamp -
+	    (long long int)second->timestamp) / 3276.8;
+  };
+
+  auto same_clover_pair_index = [](int xtal1, int xtal2) {
+    if (xtal1 > xtal2) {
+      int tmp = xtal1;
+      xtal1 = xtal2;
+      xtal2 = tmp;
+    }
+
+    if (xtal1 == 0 && xtal2 == 1) return 0;
+    if (xtal1 == 0 && xtal2 == 2) return 1;
+    if (xtal1 == 0 && xtal2 == 3) return 2;
+    if (xtal1 == 1 && xtal2 == 2) return 3;
+    if (xtal1 == 1 && xtal2 == 3) return 4;
+    if (xtal1 == 2 && xtal2 == 3) return 5;
+
+    return -1;
+  };
+
+  //auto gg_prompt = [gg_tdiff_thresh, gg_dt_ns](const auto* first, const auto* second) {
+  // const double dt =
+  // ((long long int)first->timestamp -
+  //  (long long int)second->timestamp) / 3276.8;
+  //Changing gg_prompt to match with gg_dt_ns for comparison
+  auto gg_prompt = [gg_tdiff_thresh, gg_dt_ns](const auto* first, const auto* second) {
+    const double dt = gg_dt_ns(first, second);
+    return std::abs(dt) <= gg_tdiff_thresh;
+  };
+
   int peak[2] = {75, 94};
   int tail[2] = {105,159};
 
@@ -405,6 +644,21 @@ int main(int argc, char **argv) {
 
   if (verbose) { clarion.PrintConf(); }
 
+  // BEGe setup This is to find the BEGe calibration file in FE_sorted
+  std::string begeCalFile =
+    "/data/FSU/rawdata/FSUexp/MSU_Ga72/FE_Sorted/133BaCal.cal";
+
+  BEGeCalibration begeCal[3];
+
+  if (!ReadBEGeCalibration(begeCalFile, begeCal)) {
+    std::cerr << "ERROR: failed to read BEGe calibration file: "
+              << begeCalFile << "\n";
+    return -1;
+  }
+
+  std::cout << "                 BEGe calibration : "
+	    << begeCalFile << "\n";
+
   ClarionTrinity::Event event(clarion, trinity);
 
   //ROOT histogram definitions
@@ -423,8 +677,15 @@ int main(int argc, char **argv) {
   TH2D *clar_e_eff = get_TH2D(&file, "clar_e_eff", "Energy; Energy; Clover Channel ID", 8192, 0, 4096, 16*4, 0, 16*4);
   //Chat Testing Gamma Spectra
   TH1I *pg_e_prompt_cut = get_TH1I(gDirectory,
-  "pg_e_prompt_cut", "Gamma energy (PID+prompt);Energy (keV);Counts",
-  10000, 0, 10000);
+				   "pg_e_prompt_cut", "Gamma energy (PID+prompt);Energy (keV);Counts",
+				   10000, 0, 10000);
+  // NEW: clean addback gamma singles with no PID or timing gate
+  TH1I *g_e_ungated = get_TH1I(
+			       gDirectory,
+			       "g_e_ungated",
+			       "Ungated clean gamma singles;Energy (keV);Counts",
+			       10000, 0, 10000
+			       );
   //Calibration Hist
   // Global/summed spectrum (singles)
   TH1F *h_calib_en_all   = new TH1F("calib_en_all",   "Clarion singles (all crystals);Energy [keV];Counts", 8192, 0, 4096);
@@ -433,6 +694,82 @@ int main(int argc, char **argv) {
   TH2I *raw_e = get_TH2I(&file, "raw_e", "Raw Energy; Energy; Channel ID", 4096, 0, 8*4096, 16*13, 0, 16*13); 
   // adding this hist for making calibrations using fit click tawfik
   //TH2D *raw_e_cal = get_TH2D(&file, "raw_e_cal", "Raw Energy For Cal; Energy; Channel ID", 4096, 0, 8*4096, 16*4, 0, 16*4);
+
+  /// Standalone BEGe detector spectra
+  TH1I *bege_e1_raw = get_TH1I(
+			       &file,
+			       "bege_e1_raw",
+			       "BEGe E1 Raw Spectrum;ADC Channel;Counts",
+			       32768, 0, 32768
+			       );
+
+  TH1I *bege_e2_raw = get_TH1I(
+			       &file,
+			       "bege_e2_raw",
+			       "BEGe E2 Raw Spectrum;ADC Channel;Counts",
+			       32768, 0, 32768
+			       );
+
+  TH1I *bege_e1_raw_clean = get_TH1I(
+				     &file,
+				     "bege_e1_raw_clean",
+				     "BEGe E1 Raw Spectrum, no pileup or out-of-range;ADC Channel;Counts",
+				     32768, 0, 32768
+				     );
+
+  TH1I *bege_e2_raw_clean = get_TH1I(
+				     &file,
+				     "bege_e2_raw_clean",
+				     "BEGe E2 Raw Spectrum, no pileup or out-of-range;ADC Channel;Counts",
+				     32768, 0, 32768
+				     );
+
+  TH1I *bege_e1_cal = get_TH1I(
+			       &file,
+			       "bege_e1_cal",
+			       "BEGe E1 Calibrated Spectrum;Energy (keV);Counts",
+			       8192, 0, 4096
+			       );
+
+  TH1I *bege_e1_cal_pid = get_TH1I(
+				   &file,
+				   "bege_e1_cal_pid",
+				   "BEGe E1 Calibrated PID-gated Spectrum;Energy (keV);Counts",
+				   8192, 0, 4096
+				   );
+
+  // Raw spectra for every channel in the LaBr module, slot S14
+  TH2I *labr_raw = get_TH2I(
+			    &file,
+			    "labr_raw",
+			    "LaBr raw spectra, slot S14;Raw ADC Energy;S14 Channel",
+			    8192, 0, 32768,
+			    16, 0, 16
+			    );
+
+  TH2I *labr_raw_clean = get_TH2I(
+				  &file,
+				  "labr_raw_clean",
+				  "LaBr raw spectra, slot S14, clean;Raw ADC Energy;S14 Channel",
+				  8192, 0, 32768,
+				  16, 0, 16
+				  );
+  //Testing for 1d for the labr detectors (NEED TO FILL THESE LATER ON)
+  TH1I *labr_single_raw = get_TH1I(
+			       &file,
+			       "labr_single_raw",
+			       "LaBr Raw Spectrum;ADC Channel;Counts",
+			       32768, 0, 32768
+			       );
+
+  TH1I *labr_single_raw_clean = get_TH1I(
+				     &file,
+				     "labr_single_raw_clean",
+				     "LaBr Raw Spectrum, no pileup or out-of-range;ADC Channel;Counts",
+				     32768, 0, 32768
+				     );
+
+
   TH1I *raw_pu = get_TH1I(&file, "raw_pu", "Raw Pileup; Channel ID; Counts", 16*13, 0, 16*13);
   TH1I *raw_or = get_TH1I(&file, "raw_or", "Raw Out of Range; Channel ID; Counts", 16*13, 0, 16*13);
   TH2I *raw_mult = get_TH2I(&file, "raw_mult", "Raw Subevent Multiplicity; Wall Time (s); Multiplicity", 4096, 0, 57600, 50, 0, 50);
@@ -442,6 +779,107 @@ int main(int argc, char **argv) {
   TH2I *raw_hitpat = get_TH2I(&file, "raw_hitpat", "Hit pattern; ID1; ID2", 13*16, 0, 13*16, 13*16, 0, 13*16);
   TH2I *raw_hitpat_db = get_TH2I(&file, "raw_hitpat_db", "Hit pattern; ID1; ID2", 13*16, 0, 13*16, 13*16, 0, 13*16);
   TH2I *raw_e_wt = get_TH2I(&file, "raw_e_wt", "Raw Energy vs Wall Time; Wall Time (s); Raw Energy", 4096, 0, 57600, 4096, 0, 8*4096);
+  
+  //Hist to look at count rate
+  TH1D *rate_all = new TH1D("rate_all",
+			    "All events vs elapsed time;Elapsed Time (s);Counts / s",
+			    57600, 0, 57600);
+
+  TH1I* h_clover_xtal_sum[17] = {nullptr};   // 1..16
+  TH1I* h_clover_xtal_sum_clean[17] = {nullptr}; // optional: suppressed-clean version
+  
+  //This is for the anti-gated run by run test
+  TH1I* h_bg_sum = new TH1I("h_bg_sum",
+  "Background-like summed gamma singles;Energy (keV);Counts",
+  4096, 0, 4096);
+
+  //Histograms to look at clover sums and basic gamma gamma
+  for (int cid = 1; cid <= 16; ++cid) {
+    h_clover_xtal_sum[cid] =
+      new TH1I(Form("clover%02d_xtal_sum", cid),
+	       Form("Clover %d crystal-hit singles (no addback);Energy [keV];Counts", cid),
+	       8192, 0, 4096);
+
+    h_clover_xtal_sum_clean[cid] =
+      new TH1I(Form("clover%02d_xtal_sum_clean", cid),
+	       Form("Clover %d crystal-hit singles (Suppress==false);Energy [keV];Counts", cid),
+	       8192, 0, 4096);
+  }
+
+  TH2I* gg_sameclover[17] = {nullptr};       // 1..16
+  TH2I* gg_sameclover_clean[17] = {nullptr}; // optional
+
+  for (int cid = 1; cid <= 16; ++cid) {
+    gg_sameclover[cid] =
+      new TH2I(Form("gg_sameclover%02d", cid),
+	       Form("#gamma-#gamma same clover %d (crystal hits);E1 [keV];E2 [keV]", cid),
+	       2048, 0, 4096, 2048, 0, 4096);
+
+    gg_sameclover_clean[cid] =
+      new TH2I(Form("gg_sameclover%02d_clean", cid),
+	       Form("#gamma-#gamma same clover %d (Suppress==false);E1 [keV];E2 [keV]", cid),
+	       2048, 0, 4096, 2048, 0, 4096);
+  }
+
+  // PID-gated versions THESE ARE FOR USING THE CUTS ON THE GG AND CLOVER HISTS
+  TH1I* h_clover_xtal_sum_pid[17]        = {nullptr};  // 1..16
+  TH1I* h_clover_xtal_sum_clean_pid[17]  = {nullptr};  // 1..16
+
+  TH2I* gg_sameclover_pid[17]            = {nullptr};  // 1..16
+  TH2I* gg_sameclover_pid_clean[17]      = {nullptr};  // 1..16
+
+  for (int cid = 1; cid <= 16; ++cid) {
+    h_clover_xtal_sum_pid[cid] =
+      new TH1I(Form("clover%02d_xtal_sum_pid", cid),
+	       Form("Clover %d crystal-hit singles (PID gated);Energy [keV];Counts", cid),
+	       8192, 0, 4096);
+
+    h_clover_xtal_sum_clean_pid[cid] =
+      new TH1I(Form("clover%02d_xtal_sum_clean_pid", cid),
+	       Form("Clover %d crystal-hit singles (Suppress==false, PID gated);Energy [keV];Counts", cid),
+	       8192, 0, 4096);
+
+    gg_sameclover_pid[cid] =
+      new TH2I(Form("gg_sameclover%02d_pid", cid),
+	       Form("#gamma-#gamma same clover %d (PID gated);E1 [keV];E2 [keV]", cid),
+	       2048, 0, 4096, 2048, 0, 4096);
+
+    gg_sameclover_pid_clean[cid] =
+      new TH2I(Form("gg_sameclover%02d_clean_pid", cid),
+	       Form("#gamma-#gamma same clover %d (Suppress==false, PID gated);E1 [keV];E2 [keV]", cid),
+	       2048, 0, 4096, 2048, 0, 4096);
+  }
+  
+  //THESE ARE THE TEST HISTS FOR A CLOVER-CLOVER GG
+  TH2I* gg_cloverclover = new TH2I(
+				   "gg_cloverclover",
+				   "#gamma-#gamma different clovers (all clover pairs);E1 [keV];E2 [keV]",
+				   2048, 0, 4096,
+				   2048, 0, 4096
+				   );
+
+  TH2I* gg_cloverclover_clean = new TH2I(
+					 "gg_cloverclover_clean",
+					 "#gamma-#gamma different clovers (Suppress==false);E1 [keV];E2 [keV]",
+					 2048, 0, 4096,
+					 2048, 0, 4096
+					 );
+
+  TH2I* gg_cloverclover_pid = new TH2I(
+				       "gg_cloverclover_pid",
+				       "#gamma-#gamma different clovers (PID gated);E1 [keV];E2 [keV]",
+				       2048, 0, 4096,
+				       2048, 0, 4096
+				       );
+
+  TH2I* gg_cloverclover_clean_pid = new TH2I(
+					     "gg_cloverclover_clean_pid",
+					     "#gamma-#gamma different clovers (Suppress==false, PID gated);E1 [keV];E2 [keV]",
+					     2048, 0, 4096,
+					     2048, 0, 4096
+					     );
+
+
 
   // "trin" histograms - after forming GaGG detectors 
   TH2I *trin_gainmatch = get_TH2I(&file, "trin_gainmatch", "GaGG gain match; Ratio; Trinity ID", 512, 0.5, 2.5, 600, 1, 601);
@@ -498,11 +936,113 @@ int main(int argc, char **argv) {
   int rings[6] = {0, 1, 1, 1, 1, 1};
   int trin_xtls[6] = {1, 8, 10, 14, 16, 16};
 
+  //THIS IS TESTING ADDBACK 
+  TH1I* h_addback_all = new TH1I(
+				 "h_addback_all",
+				 "All clover addback gammas;Energy [keV];Counts",
+				 8192, 0, 4096
+				 );
+
+  TH1I* h_noaddback_all = new TH1I(
+				   "h_noaddback_all",
+				   "All clover crystal-hit singles, no addback;Energy [keV];Counts",
+				   8192, 0, 4096
+				   );
+
+  // Addback gamma spectrum when TRINITY does not fire
+  TH1I* h_addback_no_trinity = new TH1I(
+					"h_addback_no_trinity",
+					"Clover addback gammas with no TRINITY hit;Energy [keV];Counts",
+					8192, 0, 4096
+					);
+
+  // Optional sanity-check spectrum: addback gammas when TRINITY does fire
+  TH1I* h_addback_with_trinity = new TH1I(
+					  "h_addback_with_trinity",
+					  "Clover addback gammas with at least one TRINITY hit;Energy [keV];Counts",
+					  8192, 0, 4096
+					  );
+
+  TH1I* h_addback_no_trinity_clean = new TH1I(
+					      "h_addback_no_trinity_clean",
+					      "Clean clover addback gammas with no TRINITY hit;Energy [keV];Counts",
+					      8192, 0, 4096
+					      );
+
+  TH2I* gg_cloverclover_ab_no_trinity = new TH2I(
+						 "gg_cloverclover_ab_no_trinity",
+						 "#gamma-#gamma clover-clover addback (no TRINITY);E1 [keV];E2 [keV]",
+						 2048, 0, 4096,
+						 2048, 0, 4096
+						 );
+  //doubled binning for Dr. Haring-Kaye GNUscope
+  TH2I* gg_cloverclover_ab_clean_no_trinity = new TH2I(
+						       "gg_cloverclover_ab_clean_no_trinity",
+						       "#gamma-#gamma clover-clover addback clean (no TRINITY);E1 [keV];E2 [keV]",
+						       2048, 0, 4096,
+						       2048, 0, 4096
+						       );
+
+  //More ADDBACK Histograms
+  TH2I* gg_cloverclover_ab = new TH2I(
+				      "gg_cloverclover_ab",
+				      "#gamma-#gamma clover-clover addback;E1 [keV];E2 [keV]",
+				      2048, 0, 4096,
+				      2048, 0, 4096
+				      );
+
+  TH2I* gg_cloverclover_ab_pid = new TH2I(
+					  "gg_cloverclover_ab_pid",
+					  "#gamma-#gamma clover-clover addback (PID gated);E1 [keV];E2 [keV]",
+					  2048, 0, 4096,
+					  2048, 0, 4096
+					  );
+  //doubled binning for GNUscope
+  TH2I* gg_cloverclover_ab_clean = new TH2I(
+					    "gg_cloverclover_ab_clean",
+					    "#gamma-#gamma clover-clover addback clean;E1 [keV];E2 [keV]",
+					    2048, 0, 4096,
+					    2048, 0, 4096
+					    );
+  //moving the binning around here to see if speed increases when trying to run files
+  TH2I* gg_cloverclover_ab_clean_pid = new TH2I(
+						"gg_cloverclover_ab_clean_pid",
+						"#gamma-#gamma clover-clover addback clean (PID gated);E1 [keV];E2 [keV]",
+						8192, 0, 4096,
+						8192, 0, 4096
+						);
+
+  TH1D* gg_sameclover_tdiff_all = new TH1D(
+					   "gg_sameclover_tdiff_all",
+					   "#gamma-#gamma time difference within same clover;#Delta t_{#gamma#gamma} [ns];Counts",
+					   2000, -1000, 1000
+					   );
+
+  TH1D* gg_sameclover_tdiff_pid = new TH1D(
+					   "gg_sameclover_tdiff_pid",
+					   "#gamma-#gamma time difference within same clover, PID gated;#Delta t_{#gamma#gamma} [ns];Counts",
+					   2000, -1000, 1000
+					   );
+
+  TH2D* gg_sameclover_e_vs_tdiff = new TH2D(
+					    "gg_sameclover_e_vs_tdiff",
+					    "#gamma energy vs #gamma-#gamma time difference within same clover;#Delta t_{#gamma#gamma} [ns];E_{#gamma} [keV]",
+					    1000, -1000, 1000,
+					    1024, 0, 4096
+					    );
+
+  TH2D* gg_sameclover_pair_vs_tdiff = new TH2D(
+					       "gg_sameclover_pair_vs_tdiff",
+					       "Same-clover crystal-pair timing;#Delta t_{#gamma#gamma} [ns];Crystal pair",
+					       1000, -1000, 1000,
+					       6, 0, 6
+					       );
+
   //file.mkdir("ac_phi");
   for (int r = 1; r<6; ++r) {
     if (rings[r] == 0) { continue; }
     //Changed the binning and upper limit of this histogram as it is overflowing. Is this energy the same as peak->sum
-    part_en[r] = get_TH1I(&file, ("part_en_r"+std::to_string(r)), "Valid particle singles energy;", 4096, 0, 65536);
+    part_en[r] = get_TH1I(&file, ("part_en_r"+std::to_string(r)), "Valid particle singles energy;", 8192, 0, 65536);
 
     pg_tdiff[r] = get_TH2I(&file, ("pg_tdiff_r"+std::to_string(r)), 
         ("Particle-gamma time difference (ring "+std::to_string(r)+"); Time (ns); Crystal ID; Counts"), 400, -2000, 2000, 16*4, 0, 16*4);
@@ -645,6 +1185,11 @@ int main(int argc, char **argv) {
 
   std::cout << "Sorting " << dataPaths.size() << " files now" << std::endl;
 
+  //Also for the counter hist
+  bool firstTimeSeen = false;
+  double t0_seconds = 0.0;
+  /////////
+
   for (int fn = 0; fn<dataPaths.size(); ++fn) {
     std::string listPath = dataPaths.at(fn); 
     int ds = 0;
@@ -697,6 +1242,7 @@ int main(int argc, char **argv) {
     reader.start(); //this is for timing
     int nValid[6] = {0}; 
     //int counter = 0;
+
     while (true) {
       ++ds;
       
@@ -711,16 +1257,85 @@ int main(int argc, char **argv) {
       int eventIndx = reader.eventCtr-1;
       PIXIE::Event *e = &(reader.events[eventIndx]);
       event.Set(reader, eventIndx);  //this sets up Clarion and Trinity objects
+      
+      //Once again more counts testing/////
+      double eventTimeSeconds =
+	reader.measurements[e->fMeasurements[0]].eventTime / (3276.8 * 1e9);
+
+      if (!firstTimeSeen) {
+	t0_seconds = eventTimeSeconds;
+	firstTimeSeen = true;
+      }
+
+      double elapsedTime = eventTimeSeconds - t0_seconds;
+      if (event.clarion.nClovers > 0) {
+	rate_all->Fill(elapsedTime);
+      }
+      ///////////
+      
       //fill histograms
       int nMeas = reader.events[eventIndx].nMeas;
       raw_mult->Fill(reader.measurements[e->fMeasurements[0]].eventTime/(3276.8*1e9), nMeas);
+      //This should allow for events in the BEGe beyond just raw
+      struct BEGeEventHit {
+	int detector = 0;
+	double rawEnergy = 0.0;
+	unsigned long long timestamp = 0;
+	bool clean = false;
+      };
+
+      std::vector<BEGeEventHit> begeHits;
+
+
       for (int i=0; i<reader.events[eventIndx].nMeas; ++i) {
         auto &meas = reader.measurements[e->fMeasurements[i]];
         int chan = meas.channelNumber;
         int mod = meas.slotID-2;
+	int ID   = mod * 16 + chan;
         int tracelength = meas.traceLength;
         double energy = meas.eventEnergy;
         raw_e->Fill(energy, mod*16+chan);
+
+	// Detector map:
+	// S2 Ch.15 = global ID 15 = BEGe E1
+	// S3 Ch.15 = global ID 31 = BEGe E2
+        if (ID == 15 || ID == 31) {
+	  const int begeDetector = (ID == 15) ? 1 : 2;
+	  const bool begeClean = !meas.finishCode && !meas.outOfRange;
+
+	  if (begeDetector == 1) {
+	    bege_e1_raw->Fill(energy);
+
+	    if (begeClean) {
+	      bege_e1_raw_clean->Fill(energy);
+	    }
+	  }
+	  else {
+	    bege_e2_raw->Fill(energy);
+
+	    if (begeClean) {
+	      bege_e2_raw_clean->Fill(energy);
+	    }
+	  }
+
+	  BEGeEventHit hit;
+	  hit.detector = begeDetector;
+	  hit.rawEnergy = energy;
+	  hit.timestamp = meas.eventTime;
+	  hit.clean = begeClean;
+
+	  begeHits.push_back(hit);
+	}
+
+	// All channels belonging to slot S14
+	if (meas.slotID == 14) {
+	  labr_raw->Fill(energy, chan);
+
+	  if (!meas.finishCode && !meas.outOfRange) {
+            labr_raw_clean->Fill(energy, chan);
+	  }
+	}
+
 	// filling calibration histogram
 	//raw_e_cal->Fill(energy, mod*16+chan);
         if (mod*16 + chan == 8) {
@@ -752,17 +1367,268 @@ int main(int argc, char **argv) {
         }
       }
 
+      //THIS IS TO MAKE SURE THE PASS_PID IS KNOWN BEFORE IT'S USED. THIS IS FOR THE GG GATED HIST
+      // ----------------------------
+      // NEW: event-level PID gate (compute BEFORE gamma fills)
+      // ----------------------------
+      int cutMult_pid = 0;
+
+      for (int i = 0; i < event.trinity.nParts; ++i) {
+	auto part = &(event.trinity.parts[i]);
+
+	// keep these consistent with how you define "good" particles elsewhere
+	if (!part->clean) continue;
+
+	if (cuts[part->GaggID] == NULL) continue;
+	if (!cuts[part->GaggID]->IsInside((float)part->tail, (float)part->peak)) continue;
+
+	++cutMult_pid;
+      }
+
+      // matches your "if (cutMult != 1) continue;" style strictness
+      bool pass_pid = (cutMult_pid == 1);
+      bool anti_pid = (cutMult_pid == 0);
+
+      // True event-level no-particle condition.
+      // This means the event builder found zero TRINITY particle objects in this event.
+      bool no_trinity = (event.trinity.nParts == 0);
+
+      // Optional opposite condition, useful for testing
+      bool has_trinity = (event.trinity.nParts > 0);
+
+      //This block should calibrate the BEGe
+      for (const auto& hit : begeHits) {
+	if (!hit.clean) {
+	  continue;
+	}
+
+	const auto& cal = begeCal[hit.detector];
+
+	if (!cal.valid) {
+	  continue;
+	}
+
+	const double calibratedEnergy =
+	  cal.intercept + cal.slope * hit.rawEnergy;
+
+	if (calibratedEnergy < 0.0 ||
+	    calibratedEnergy >= 4096.0) {
+	  continue;
+	}
+
+	if (hit.detector == 1) {
+	  bege_e1_cal->Fill(calibratedEnergy);
+
+	  if (pass_pid) {
+            bege_e1_cal_pid->Fill(calibratedEnergy);
+	  }
+	}
+      }
+
       //hits, no addback
-      for (int ih=0; ih<event.clarion.nHits; ++ih) {
+      /*for (int ih=0; ih<event.clarion.nHits; ++ih) {
         ClarionTrinity::ClarionHit *hit = event.clarion.hits[ih];
         clar_hits->Fill(hit->Energy, (hit->CloverID - 1)*4 + hit->CrystalID);
 
         if (hit->Suppress == false) {
           clar_hitsclean->Fill(hit->Energy, (hit->CloverID - 1)*4 + hit->CrystalID);
         }
+	}*/
+
+      // ----------------------------
+      // hits, no addback
+      // ----------------------------
+      std::vector<const ClarionTrinity::ClarionHit*> hits_by_clover[17];
+      std::vector<const ClarionTrinity::ClarionHit*> hits_by_clover_clean[17]; // optional
+
+      for (int ih = 0; ih < event.clarion.nHits; ++ih) {
+	ClarionTrinity::ClarionHit* hit = event.clarion.hits[ih];
+
+	int cid = hit->CloverID;
+	int xid = (hit->CloverID - 1)*4 + hit->CrystalID;
+
+	// existing
+	clar_hits->Fill(hit->Energy, xid);
+
+	// NEW: global no-addback singles spectrum
+	if (hit->Energy >= 30 && hit->Energy <= 4096) {
+	  h_noaddback_all->Fill(hit->Energy);
+	}
+
+	// NEW: per-clover singles (no addback)
+	if (cid >= 1 && cid <= 16) {
+	  h_clover_xtal_sum[cid]->Fill(hit->Energy);
+	  hits_by_clover[cid].push_back(hit);
+	  // PID-gated versions (NEW)
+	  if (pass_pid) {
+	    h_clover_xtal_sum_pid[cid]->Fill(hit->Energy);
+	  }
+	}
+
+	// existing + NEW clean variants
+	if (hit->Suppress == false) {
+	  clar_hitsclean->Fill(hit->Energy, xid);
+
+	  if (cid >= 1 && cid <= 16) {
+	    h_clover_xtal_sum_clean[cid]->Fill(hit->Energy);
+	    hits_by_clover_clean[cid].push_back(hit);
+	    if (pass_pid) {
+	      h_clover_xtal_sum_clean_pid[cid]->Fill(hit->Energy);
+	    }
+	  }
+	}
+      }
+
+      // ----------------------------
+      // gamma-gamma: same clover, crystal-crystal (no addback)
+      // ----------------------------
+      for (int cid = 1; cid <= 16; ++cid) {
+	auto& v = hits_by_clover[cid];
+	int n = (int)v.size();
+	if (n < 2) continue;
+
+	for (int a = 0; a < n; ++a) {
+	  
+	  for (int b = a + 1; b < n; ++b) {
+	    //Can prob remove the line under this comment
+	    if (v[a]->CrystalID == v[b]->CrystalID) continue; // require different crystals
+
+	    //THIS IS TO TEST TIMING WINDOW FOR ADDBACK PURPOSES
+	    // Calculate gamma-gamma time difference in ns.
+	    double dt = gg_dt_ns(v[a], v[b]);
+
+	    double e1_pre = v[a]->Energy;
+	    double e2_pre = v[b]->Energy;
+
+	    int xtal1 = v[a]->CrystalID;
+	    int xtal2 = v[b]->CrystalID;
+	    int pair_index = same_clover_pair_index(xtal1, xtal2);
+
+	    // ----------------------------
+	    // Fill timing diagnostics BEFORE prompt cut
+	    // ----------------------------
+
+	    gg_sameclover_tdiff_all->Fill(dt);
+
+	    if (pass_pid) {
+	      gg_sameclover_tdiff_pid->Fill(dt);
+	    }
+
+	    gg_sameclover_e_vs_tdiff->Fill(dt, e1_pre);
+	    gg_sameclover_e_vs_tdiff->Fill(dt, e2_pre);
+
+	    if (pair_index >= 0) {
+	      gg_sameclover_pair_vs_tdiff->Fill(dt, pair_index);
+	    }
+
+	    // ----------------------------
+	    // Existing prompt cut
+	    // ----------------------------
+	    if (!gg_prompt(v[a], v[b])) continue;             // require prompt timing
+	     
+
+	    double e1 = v[a]->Energy;
+	    double e2 = v[b]->Energy;
+
+	    gg_sameclover[cid]->Fill(e1, e2);
+	    gg_sameclover[cid]->Fill(e2, e1); // symmetric (optional)
+
+	    if (pass_pid) {
+	      gg_sameclover_pid[cid]->Fill(e1, e2);
+	      gg_sameclover_pid[cid]->Fill(e2, e1);
+	    }
+	  }
+	}
+      }
+
+      // Optional: clean gg
+      for (int cid = 1; cid <= 16; ++cid) {
+	auto& v = hits_by_clover_clean[cid];
+	int n = (int)v.size();
+	if (n < 2) continue;
+
+	for (int a = 0; a < n; ++a) {
+	  for (int b = a + 1; b < n; ++b) {
+	    if (v[a]->CrystalID == v[b]->CrystalID) continue;
+	    if (!gg_prompt(v[a], v[b])) continue;
+
+	    gg_sameclover_clean[cid]->Fill(v[a]->Energy, v[b]->Energy);
+	    gg_sameclover_clean[cid]->Fill(v[b]->Energy, v[a]->Energy);
+
+	    if (pass_pid) {
+	      gg_sameclover_pid_clean[cid]->Fill(v[a]->Energy, v[b]->Energy);
+	      gg_sameclover_pid_clean[cid]->Fill(v[b]->Energy, v[a]->Energy);
+	    }
+	  }
+	}
+      }
+      
+      // ----------------------------
+      // gamma-gamma: different clovers (crystal hits, no addback)
+      // ----------------------------
+      for (int cid1 = 1; cid1 <= 16; ++cid1) {
+	auto& v1 = hits_by_clover[cid1];
+	if (v1.empty()) continue;
+
+	for (int cid2 = cid1 + 1; cid2 <= 16; ++cid2) {
+	  auto& v2 = hits_by_clover[cid2];
+	  if (v2.empty()) continue;
+
+	  for (size_t a = 0; a < v1.size(); ++a) {
+	    for (size_t b = 0; b < v2.size(); ++b) {
+	      if (!gg_prompt(v1[a], v2[b])) continue;
+
+
+	      double e1 = v1[a]->Energy;
+	      double e2 = v2[b]->Energy;
+
+	      gg_cloverclover->Fill(e1, e2);
+	      gg_cloverclover->Fill(e2, e1); // symmetric optional
+
+	      if (pass_pid) {
+		gg_cloverclover_pid->Fill(e1, e2);
+		gg_cloverclover_pid->Fill(e2, e1);
+	      }
+	    }
+	  }
+	}
+      }
+
+      // Clean versions (Suppress==false hits only)
+      for (int cid1 = 1; cid1 <= 16; ++cid1) {
+	auto& v1 = hits_by_clover_clean[cid1];
+	if (v1.empty()) continue;
+
+	for (int cid2 = cid1 + 1; cid2 <= 16; ++cid2) {
+	  auto& v2 = hits_by_clover_clean[cid2];
+	  if (v2.empty()) continue;
+
+	  for (size_t a = 0; a < v1.size(); ++a) {
+	    for (size_t b = 0; b < v2.size(); ++b) {
+
+	      if (!gg_prompt(v1[a], v2[b])) continue;
+
+	      double e1 = v1[a]->Energy;
+	      double e2 = v2[b]->Energy;
+
+	      gg_cloverclover_clean->Fill(e1, e2);
+	      gg_cloverclover_clean->Fill(e2, e1);
+
+	      if (pass_pid) {
+		gg_cloverclover_clean_pid->Fill(e1, e2);
+		gg_cloverclover_clean_pid->Fill(e2, e1);
+	      }
+	    }
+	  }
+	}
       }
 
       //clovers, addback
+      //So addback testing works
+      std::vector<const ClarionTrinity::Gamma*> gammas_by_clover[17];
+      std::vector<const ClarionTrinity::Gamma*> gammas_by_clover_clean[17];
+
+
       for (int iCl=0; iCl<event.clarion.nClovers; ++iCl) {
         auto clover_i = &(event.clarion.clovers[iCl]);
         int ID_i = clover_i->CloverID;
@@ -781,9 +1647,28 @@ int main(int argc, char **argv) {
         for (int iGam=0; iGam<clover_i->nGammas; ++iGam) {
           //not sure if this should be here or not
           //will keep for consistency with Mitch for now MIGHT NOT NEED THIS 
-          if (iGam > 0) { continue; }
+	  // if (iGam > 0) { continue; }
 
           ClarionTrinity::Gamma *gam_i = &(clover_i->gammas[iGam]);
+
+	  // NEW: addback singles test + save gamma by clover
+	  if (ID_i >= 1 && ID_i <= 16) {
+	    if (gam_i->Energy >= 30 && gam_i->Energy <= 4096) {
+	      h_addback_all->Fill(gam_i->Energy);
+
+	      // Addback spectrum for events where TRINITY did not fire
+	      if (no_trinity) {
+		h_addback_no_trinity->Fill(gam_i->Energy);
+	      }
+
+	      // Optional sanity-check spectrum for events where TRINITY did fire
+	      if (has_trinity) {
+		h_addback_with_trinity->Fill(gam_i->Energy);
+	      }
+	      gammas_by_clover[ID_i].push_back(gam_i);
+	    }
+	  }
+
           int iMaxEnInd = gam_i->MaxEnInd;
           int idi = (ID_i-1)*4 + clover_i->hits[iMaxEnInd].CrystalID;
 
@@ -792,7 +1677,26 @@ int main(int argc, char **argv) {
 	  // Ungated singles for calibration (works on pure 60Co runs)
 	  h_calib_en_all->Fill(gam_i->Energy);
 
+	  // Anti-PID singles for background-line checking
+	  if (anti_pid) {
+	    h_bg_sum->Fill(gam_i->Energy);
+	  }
+
           if (!Clean(clover_i)) { continue; }
+
+	  // NEW: no PID cut and no particle-gamma timing cut
+	  g_e_ungated->Fill(gam_i->Energy);
+
+	  // Clean no-TRINITY addback spectrum
+	  if (no_trinity && gam_i->Energy >= 30 && gam_i->Energy <= 4096) {
+	    h_addback_no_trinity_clean->Fill(gam_i->Energy);
+	  }
+
+	  if (ID_i >= 1 && ID_i <= 16) {
+	    if (gam_i->Energy >= 30 && gam_i->Energy <= 4096) {
+	      gammas_by_clover_clean[ID_i].push_back(gam_i);
+	    }
+	  }
 
           clar_e->Fill(gam_i->Energy, idi);
 
@@ -803,6 +1707,81 @@ int main(int argc, char **argv) {
 
           clar_e_eff->Fill(gam_i->Energy, idi, 1.0/efficiencyID);
         }
+      }
+
+      // ----------------------------
+      // gamma-gamma: different clovers using addback gammas
+      // ----------------------------
+      for (int cid1 = 1; cid1 <= 16; ++cid1) {
+	auto &v1 = gammas_by_clover[cid1];
+	if (v1.empty()) continue;
+
+	for (int cid2 = cid1 + 1; cid2 <= 16; ++cid2) {
+	  auto &v2 = gammas_by_clover[cid2];
+	  if (v2.empty()) continue;
+
+	  for (size_t a = 0; a < v1.size(); ++a) {
+	    for (size_t b = 0; b < v2.size(); ++b) {
+
+	      if (!gg_prompt(v1[a], v2[b])) continue;
+
+	      double e1 = v1[a]->Energy;
+	      double e2 = v2[b]->Energy;
+
+	      gg_cloverclover_ab->Fill(e1, e2);
+	      gg_cloverclover_ab->Fill(e2, e1);  // symmetric fill
+
+	      // NEW: fill only when TRINITY did not fire
+	      if (no_trinity) {
+		gg_cloverclover_ab_no_trinity->Fill(e1, e2);
+		gg_cloverclover_ab_no_trinity->Fill(e2, e1);
+	      }
+
+	      if (pass_pid) {
+		gg_cloverclover_ab_pid->Fill(e1, e2);
+		gg_cloverclover_ab_pid->Fill(e2, e1);
+	      }
+	    }
+	  }
+	}
+      }
+      
+      // ----------------------------
+      // gamma-gamma: different clovers using CLEAN addback gammas
+      // ----------------------------
+      for (int cid1 = 1; cid1 <= 16; ++cid1) {
+	auto &v1 = gammas_by_clover_clean[cid1];
+	if (v1.empty()) continue;
+
+	for (int cid2 = cid1 + 1; cid2 <= 16; ++cid2) {
+	  auto &v2 = gammas_by_clover_clean[cid2];
+	  if (v2.empty()) continue;
+
+	  for (size_t a = 0; a < v1.size(); ++a) {
+	    for (size_t b = 0; b < v2.size(); ++b) {
+
+	      if (!gg_prompt(v1[a], v2[b])) continue;
+
+	      double e1 = v1[a]->Energy;
+	      double e2 = v2[b]->Energy;
+
+	      gg_cloverclover_ab_clean->Fill(e1, e2);
+	      gg_cloverclover_ab_clean->Fill(e2, e1);
+
+	      // NEW: clean gamma-gamma with no TRINITY
+	      if (no_trinity) {
+		gg_cloverclover_ab_clean_no_trinity->Fill(e1, e2);
+		gg_cloverclover_ab_clean_no_trinity->Fill(e2, e1);
+	      }
+
+	      // optional PID-gated clean version
+	       if (pass_pid) {
+	         gg_cloverclover_ab_clean_pid->Fill(e1, e2);
+	         gg_cloverclover_ab_clean_pid->Fill(e2, e1);
+	       }
+	    }
+	  }
+	}
       }
 
       int dirtyMult = 0;  //number of particles not passing clean conditions
@@ -873,6 +1852,10 @@ int main(int argc, char **argv) {
           ++dirtyMult;
         }
       } //particle loop end
+
+      // --- NEW: event-level PID gate for gamma histograms ---
+      // THIS IS HELPING APPLY GATES TO THE GG HISTOGRAMS
+      //bool pass_pid = (cutMult == 1);   // matches your later "if (cutMult != 1) continue;" This is a redefinition that shouldn't be here but keeping it for the time being
 
       part_dmult->Fill(dirtyMult);
       part_mult->Fill(cleanMult);
@@ -1062,6 +2045,10 @@ int main(int argc, char **argv) {
 
             
             if (pg_p[0] < tdiff && tdiff < pg_p[1]) {
+	      
+	      //Filling cut and tdiff gated spectra
+	      pg_e_prompt_cut->Fill(gam_i->Energy);
+
               for (int jCl = iCl+1; jCl < event.clarion.nClovers; ++jCl) {
                 auto clover_j = &(event.clarion.clovers[jCl]);
                 if (!Clean(clover_j)) { continue; }
@@ -1075,8 +2062,6 @@ int main(int argc, char **argv) {
 
                   double tdiff_j = (double)((long long int)(gam_j->timestamp - part->time))/3276.8;
 
-		  //Filling cut and tdiff gated spectra
-		  pg_e_prompt_cut->Fill(gam_i->Energy);
 
                   if (pg_p[0] < tdiff_j && tdiff_j < pg_p[1]) {
                     float gTheta_j = event.clarion.conf.theta[jCloverID][jCrystalID];
